@@ -24,6 +24,7 @@ import {
   kRawSocket,
   SocketController,
   type FlushPendingDataFunction,
+  type TcpHandle,
 } from '../net/socket-controller'
 import { unwrapPendingData } from '../net/utils/flush-writes'
 import { FetchResponse } from '../../utils/fetch-utils'
@@ -32,6 +33,41 @@ import { requestContext } from '../../request-context'
 import { Interceptor } from '#/src/interceptor'
 
 const httpLogger = createLogger('http-request')
+
+/**
+ * Clear the idle timeout timer of the socket and any socket it wraps.
+ * @note The stock `net.Socket._destroy` clears the timer itself, so this
+ * override has to do the same. `socket.setTimeout(0)` cannot be used here:
+ * it returns early once the socket is destroyed. Node.js keeps the timer
+ * under an internal symbol.
+ */
+function clearSocketTimeout(socket: net.Socket): void {
+  let currentSocket: net.Socket | null = socket
+
+  while (currentSocket) {
+    const timeoutSymbol = Object.getOwnPropertySymbols(currentSocket).find(
+      (symbol) => symbol.description === 'timeout'
+    )
+
+    if (timeoutSymbol) {
+      const socketInternals = currentSocket as unknown as Record<
+        symbol,
+        NodeJS.Timeout | null
+      >
+      const timer = socketInternals[timeoutSymbol]
+
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      socketInternals[timeoutSymbol] = null
+    }
+
+    currentSocket =
+      (currentSocket as net.Socket & { _parent?: net.Socket | null })._parent ??
+      null
+  }
+}
 
 /**
  * Interceptor for HTTP requests in Node.js.
@@ -743,6 +779,28 @@ export class NodeHttpRequestSource extends Interceptor<HttpRequestEventMap> {
       error: Error | null,
       callback: (error: Error | null) => void
     ) {
+      /**
+       * @note Release the socket's TCP handle and idle timeout. This override
+       * replaces the stock `_destroy`, which would otherwise close the handle
+       * and clear the timer. An open handle pins the controller captured by
+       * its wrapped "connect", and an armed timer pins the socket, so every
+       * mocked connection would stay reachable for the life of the process.
+       * @see https://github.com/mswjs/interceptors/issues/877
+       */
+      clearSocketTimeout(this)
+
+      if (this._handle) {
+        this._handle.close()
+        /**
+         * @note Detach the closed handle like the stock `_destroy` does.
+         * `net.Socket` is typed with a non-null handle, so narrow it here.
+         */
+        const socketWithHandle = this as Omit<net.Socket, '_handle'> & {
+          _handle: TcpHandle | null
+        }
+        socketWithHandle._handle = null
+      }
+
       if (error) {
         /**
          * Emit the error event as a microtask instead of relying on the default
